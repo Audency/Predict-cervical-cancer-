@@ -1,288 +1,396 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Reviewer 5 additional analyses for the cervical-cancer in-hospital mortality paper.
-Faithfully reproduces the existing pipeline (encoding, 80/20 stratified split seed=42,
-SMOTE on train, GridSearchCV over 5 models, StratifiedKFold(5), scoring='roc_auc'),
-then ADDS ONLY what is missing:
-  (1) Calibration curves (reliability diagrams) for all 5 models  -> Reviewer 5, comment 1
-  (2) Brier score + 95% CI (bootstrap) for all models             -> supports comment 1
-  (3) Multi-threshold performance table (Table S1 rebuilt)        -> Reviewer 5, comment 2b
-  (4) Decision Curve Analysis (net benefit) for all models        -> Reviewer 5, comment 2c
-"""
-import os, sys, glob, json
+# =============================================================================
+#  Additional model-evaluation analyses (Reviewer 5, BMC Cancer — Revision 4)
+#
+#  Paper : Machine learning for hospital-level risk stratification of in-hospital
+#          mortality in cervical cancer hospitalizations (Mato Grosso, Brazil).
+#
+#  This script reproduces the published modelling pipeline and adds the analyses
+#  requested by Reviewer 5:
+#
+#     1. AUROC and Brier score, each with a bootstrap 95% confidence interval.
+#     2. Calibration curves (reliability diagrams) — before AND after post-hoc
+#        isotonic recalibration.
+#     3. A multi-threshold performance table (Supplementary Table S1),
+#        thresholds 0.10–0.90.
+#     4. Decision curve analysis (net benefit) vs. treat-all / treat-none.
+#
+#  The pipeline is identical to the notebook (feature encoding, 80/20 stratified
+#  split with random_state=42, SMOTE on the training fold, GridSearchCV over the
+#  same hyper-parameter grids). Analyses are run on the *analytic sample*
+#  (n = 3,493) obtained by excluding records with unknown race.
+#
+#  Usage
+#  -----
+#      python reviewer5_additional_analyses.py [path/to/Banco_Internacao.csv]
+#
+#  Outputs are written to ./outputs (figures at 300 dpi + CSV tables).
+# =============================================================================
+
+import os
+import sys
+import glob
+import json
+
 import numpy as np
 import pandas as pd
+
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")               # headless backend — write figures to disk only
 import matplotlib.pyplot as plt
 
 from sklearn.preprocessing import LabelEncoder
-from category_encoders import TargetEncoder
 from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import (roc_curve, auc, confusion_matrix, recall_score,
-                             precision_score, f1_score, accuracy_score,
-                             matthews_corrcoef, brier_score_loss)
-from sklearn.calibration import calibration_curve
+from sklearn.calibration import calibration_curve, CalibratedClassifierCV
+from sklearn.base import clone
+from sklearn.metrics import (
+    roc_curve, auc, confusion_matrix, brier_score_loss,
+    accuracy_score, recall_score, precision_score, f1_score, matthews_corrcoef,
+)
+from category_encoders import TargetEncoder
 from imblearn.over_sampling import SMOTE
 from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
 from xgboost import XGBClassifier
 
-RNG = 42
-np.random.seed(RNG)
 
-# ---------------------------------------------------------------- paths
-HERE = os.path.dirname(os.path.abspath(__file__))
-CSV_CANDIDATES = sys.argv[1:2] or glob.glob(os.path.join(HERE, "**", "Banco_Internacao.csv"), recursive=True)
-assert CSV_CANDIDATES, "Banco_Internacao.csv not found"
-CSV_PATH = CSV_CANDIDATES[0]
-OUT = os.path.join(HERE, "outputs")
-os.makedirs(OUT, exist_ok=True)
-print(f"[data] {CSV_PATH}")
-print(f"[out ] {OUT}")
+# -----------------------------------------------------------------------------
+#  Configuration
+# -----------------------------------------------------------------------------
+RANDOM_STATE = 42
+N_BOOTSTRAP  = 2000                 # resamples for the bootstrap confidence intervals
+THRESHOLDS   = np.round(np.arange(0.10, 0.91, 0.10), 2)
 
-# ---------------------------------------------------------------- load (as in notebook)
-df = pd.read_csv(CSV_PATH, sep=";").drop("Sexo", axis=1)
+# Display order and styling, shared by every figure/table
+MODEL_ORDER = ["XGBoost", "RandomForest", "CatBoost", "LGBM", "LogisticRegression"]
+NICE_NAME   = {"LGBM": "LightGBM", "LogisticRegression": "Logistic Regression"}
+COLOR       = {"XGBoost": "#0d5c63", "RandomForest": "#c1666b", "CatBoost": "#e08e0b",
+               "LGBM": "#5b8c5a", "LogisticRegression": "#7d7d7d"}
+label = lambda name: NICE_NAME.get(name, name)
 
-# analytic sample used in the manuscript: exclude records with unknown race
-# (R cleaning script line 235: filter(RacaCor != "*Nao informado")) -> n=3493, deaths=345
-df = df[df["RacaCor"] != "*Nao informado"].reset_index(drop=True)
-print(f"[filter] RacaCor != '*Nao informado' -> n={len(df)}")
+# Columns (raw dataset)
+NUMERIC_COLS = ["DiasDePermanencia", "NumeroInternacoes", "ValorTotal", "Idade"]
+CATEG_COLS   = ["AnoInternacao", "CaraterInternacao", "Complexidade", "DiagnosticoPrincipal",
+                "Especialidade", "FoiAObito", "Gestao", "HospitalNome", "MunicipioResidencia",
+                "ProcedimentoGrupo", "RacaCor", "Regime", "TeveDiariasUTI"]
+# English feature names (order must match NUMERIC_COLS + CATEG_COLS minus the target)
+FEATURE_NAMES = ["Length of Stay", "Number of Admissions", "Total Cost", "Age",
+                 "Year of Admission", "Admission Type", "Complexity", "Main Diagnosis",
+                 "Medical Specialty", "Management", "Hospital", "City of Residence",
+                 "Procedure Group", "Race Color", "Regimen", "Intensive Care Unit"]
 
-cols_num = ['DiasDePermanencia', 'NumeroInternacoes', 'ValorTotal', 'Idade']
-cols_cat = ['AnoInternacao', 'CaraterInternacao', 'Complexidade', 'DiagnosticoPrincipal',
-            'Especialidade', 'FoiAObito', 'Gestao', 'HospitalNome',
-            'MunicipioResidencia', 'ProcedimentoGrupo', 'RacaCor', 'Regime', 'TeveDiariasUTI']
 
-data = df.loc[:, cols_num + cols_cat].copy()
-data['ValorTotal'] = data['ValorTotal'].astype(str).str.replace(',', '.').astype(float)
+# -----------------------------------------------------------------------------
+#  Data loading and preprocessing
+# -----------------------------------------------------------------------------
+def load_analytic_sample(csv_path):
+    """Load the SIH/SUS data and restrict to the analytic sample used in the paper.
 
-# mean imputation for numeric (as described in the manuscript), if any missing
-for c in cols_num:
-    if data[c].isna().any():
-        data[c] = data[c].fillna(data[c].mean())
+    The analytic sample (n = 3,493) excludes records with unknown race
+    (RacaCor == '*Nao informado'), mirroring the R data-cleaning step.
+    """
+    df = pd.read_csv(csv_path, sep=";").drop("Sexo", axis=1)
+    df = df[df["RacaCor"] != "*Nao informado"].reset_index(drop=True)
+    print(f"[data] {csv_path}")
+    print(f"[data] analytic sample: n={len(df)}  deaths={(df['FoiAObito'] == 'Sim').sum()}")
+    return df
 
-print(f"[data] shape={data.shape}  deaths={int((data['FoiAObito']=='Sim').sum()) if data['FoiAObito'].dtype==object else data['FoiAObito'].sum()}")
 
-# ---------------------------------------------------------------- encoding (as in notebook)
-label_encoding_cols = ['AnoInternacao', 'CaraterInternacao', 'Complexidade', 'DiagnosticoPrincipal',
-                       'Especialidade', 'Gestao', 'ProcedimentoGrupo', 'RacaCor', 'Regime',
-                       'TeveDiariasUTI', 'FoiAObito']
-target_encoding_cols = ['HospitalNome', 'MunicipioResidencia', 'DiagnosticoPrincipal']
+def build_features(df):
+    """Encode predictors and return the model matrix X and target y.
 
-le = LabelEncoder()
-for col in label_encoding_cols:
-    data[col] = le.fit_transform(data[col])
+    - numeric 'ValorTotal' uses a comma decimal separator -> convert to float;
+      any missing numeric values are mean-imputed.
+    - categorical predictors are label-encoded; high-cardinality columns
+      (hospital, city, main diagnosis) are additionally target-encoded.
+    """
+    data = df.loc[:, NUMERIC_COLS + CATEG_COLS].copy()
+    data["ValorTotal"] = data["ValorTotal"].astype(str).str.replace(",", ".").astype(float)
+    for col in NUMERIC_COLS:
+        if data[col].isna().any():
+            data[col] = data[col].fillna(data[col].mean())
 
-te = TargetEncoder(cols=target_encoding_cols)
-data[target_encoding_cols] = te.fit_transform(data[target_encoding_cols], data['FoiAObito'])
+    label_cols  = ["AnoInternacao", "CaraterInternacao", "Complexidade", "DiagnosticoPrincipal",
+                   "Especialidade", "Gestao", "ProcedimentoGrupo", "RacaCor", "Regime",
+                   "TeveDiariasUTI", "FoiAObito"]
+    target_cols = ["HospitalNome", "MunicipioResidencia", "DiagnosticoPrincipal"]
 
-X = data.drop(columns=['FoiAObito'])
-y = data['FoiAObito']
+    encoder = LabelEncoder()
+    for col in label_cols:
+        data[col] = encoder.fit_transform(data[col])
+    data[target_cols] = TargetEncoder(cols=target_cols).fit_transform(data[target_cols], data["FoiAObito"])
 
-X.columns = ['Length of Stay', 'Number of Admissions', 'Total Cost', 'Age',
-             'Year of Admission', 'Admission Type', 'Complexity', 'Main Diagnosis',
-             'Medical Specialty', 'Management', 'Hospital', 'City of Residence',
-             'Procedure Group', 'Race Color', 'Regimen', 'Intensive Care Unit']
+    X = data.drop(columns=["FoiAObito"])
+    y = data["FoiAObito"]
+    X.columns = FEATURE_NAMES
+    return X, y
 
-print(f"[y] positive rate = {y.mean():.4f}")
 
-# ---------------------------------------------------------------- split + SMOTE (as in notebook)
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=RNG, stratify=y)
-X_train_s, y_train_s = SMOTE(random_state=RNG).fit_resample(X_train, y_train)
+# -----------------------------------------------------------------------------
+#  Model definitions and training
+# -----------------------------------------------------------------------------
+def model_grid():
+    """Return {name: (estimator, param_grid)} — identical to the notebook."""
+    return {
+        "LogisticRegression": (LogisticRegression(max_iter=1000),
+                               {"C": [0.1, 1, 10]}),
+        "RandomForest":       (RandomForestClassifier(random_state=RANDOM_STATE),
+                               {"n_estimators": [100, 200], "max_depth": [10, 20, None],
+                                "min_samples_split": [2, 5]}),
+        "CatBoost":           (CatBoostClassifier(random_state=RANDOM_STATE, silent=True),
+                               {"depth": [4, 6, 8], "learning_rate": [0.01, 0.1, 0.3],
+                                "iterations": [100, 200]}),
+        "LGBM":               (LGBMClassifier(random_state=RANDOM_STATE, verbose=-1),
+                               {"num_leaves": [31, 50], "learning_rate": [0.01, 0.1, 0.3],
+                                "n_estimators": [100, 200]}),
+        "XGBoost":            (XGBClassifier(random_state=RANDOM_STATE, use_label_encoder=False,
+                                             eval_metric="logloss"),
+                               {"max_depth": [4, 6, 8], "learning_rate": [0.01, 0.1, 0.3],
+                                "n_estimators": [100, 200]}),
+    }
 
-# ---------------------------------------------------------------- models + tuning (as in notebook)
-models = {
-    'LogisticRegression': (LogisticRegression(max_iter=1000), {'C': [0.1, 1, 10]}),
-    'RandomForest': (RandomForestClassifier(random_state=RNG),
-                     {'n_estimators': [100, 200], 'max_depth': [10, 20, None], 'min_samples_split': [2, 5]}),
-    'CatBoost': (CatBoostClassifier(random_state=RNG, silent=True),
-                 {'depth': [4, 6, 8], 'learning_rate': [0.01, 0.1, 0.3], 'iterations': [100, 200]}),
-    'LGBM': (LGBMClassifier(random_state=RNG, verbose=-1),
-             {'num_leaves': [31, 50], 'learning_rate': [0.01, 0.1, 0.3], 'n_estimators': [100, 200]}),
-    'XGBoost': (XGBClassifier(random_state=RNG, use_label_encoder=False, eval_metric='logloss'),
-                {'max_depth': [4, 6, 8], 'learning_rate': [0.01, 0.1, 0.3], 'n_estimators': [100, 200]}),
-}
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RNG)
 
-best_models, proba = {}, {}
-for name, (mdl, params) in models.items():
-    print(f"[fit] {name} ...", flush=True)
-    gs = GridSearchCV(mdl, param_grid=params, cv=cv, scoring='roc_auc', n_jobs=-1)
-    gs.fit(X_train_s, y_train_s)
-    best_models[name] = gs.best_estimator_
-    proba[name] = gs.best_estimator_.predict_proba(X_test)[:, 1]
-    print(f"      best: {gs.best_params_}")
+def tune_models(X_train_smote, y_train_smote):
+    """Tune each model with 5-fold cross-validated grid search (scoring = ROC-AUC)."""
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    best = {}
+    for name, (estimator, grid) in model_grid().items():
+        print(f"[fit] {name} ...", flush=True)
+        search = GridSearchCV(estimator, param_grid=grid, cv=cv, scoring="roc_auc", n_jobs=-1)
+        search.fit(X_train_smote, y_train_smote)
+        best[name] = search.best_estimator_
+        print(f"      best params: {search.best_params_}")
+    return best
 
-# nice display order / colors
-ORDER = ['XGBoost', 'RandomForest', 'CatBoost', 'LGBM', 'LogisticRegression']
-LABELS = {'LGBM': 'LightGBM', 'LogisticRegression': 'Logistic Regression'}
-COLORS = {'XGBoost': '#0d5c63', 'RandomForest': '#c1666b', 'CatBoost': '#e08e0b',
-          'LGBM': '#5b8c5a', 'LogisticRegression': '#7d7d7d'}
-lbl = lambda n: LABELS.get(n, n)
 
-# ================================================================ (2) Brier + 95% CI
-def brier_ci(yt, p, n_boot=2000, seed=RNG):
-    yt = np.asarray(yt); p = np.asarray(p)
-    base = brier_score_loss(yt, p)
-    rng = np.random.default_rng(seed)
-    idx = np.arange(len(yt))
-    bs = [brier_score_loss(yt[b], p[b]) for b in (rng.choice(idx, len(idx), replace=True) for _ in range(n_boot))]
-    lo, hi = np.percentile(bs, [2.5, 97.5])
-    return base, lo, hi
-
-def auc_ci(yt, p, n_boot=2000, seed=RNG):
-    yt = np.asarray(yt); p = np.asarray(p)
-    base = auc(*roc_curve(yt, p)[:2])
-    rng = np.random.default_rng(seed); idx = np.arange(len(yt)); bs = []
-    for _ in range(n_boot):
+# -----------------------------------------------------------------------------
+#  Statistics helpers
+# -----------------------------------------------------------------------------
+def _bootstrap_ci(metric_fn, y_true, y_prob, n=N_BOOTSTRAP, seed=RANDOM_STATE):
+    """Percentile bootstrap 95% CI for a probabilistic metric (AUROC or Brier)."""
+    y_true, y_prob = np.asarray(y_true), np.asarray(y_prob)
+    rng, idx, scores = np.random.default_rng(seed), np.arange(len(y_true)), []
+    for _ in range(n):
         b = rng.choice(idx, len(idx), replace=True)
-        if len(np.unique(yt[b])) < 2:
+        if len(np.unique(y_true[b])) < 2:      # AUROC undefined for a single-class resample
             continue
-        fpr, tpr, _ = roc_curve(yt[b], p[b]); bs.append(auc(fpr, tpr))
-    lo, hi = np.percentile(bs, [2.5, 97.5])
-    return base, lo, hi
+        scores.append(metric_fn(y_true[b], y_prob[b]))
+    lo, hi = np.percentile(scores, [2.5, 97.5])
+    return metric_fn(y_true, y_prob), lo, hi
 
-brier_rows = []
-for name in ORDER:
-    b, blo, bhi = brier_ci(y_test.values, proba[name])
-    a, alo, ahi = auc_ci(y_test.values, proba[name])
-    brier_rows.append({'Model': lbl(name),
-                       'AUC-ROC': round(a, 3), 'AUC 95% CI': f"{alo:.3f}-{ahi:.3f}",
-                       'Brier': round(b, 3), 'Brier 95% CI': f"{blo:.3f}-{bhi:.3f}"})
-brier_df = pd.DataFrame(brier_rows)
-brier_df.to_csv(os.path.join(OUT, "discrimination_calibration.csv"), index=False)
-print("\n[AUROC + Brier with 95% CI]\n", brier_df.to_string(index=False))
 
-# ================================================================ (1) Calibration curves (before vs after recalibration)
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.base import clone
+auc_score = lambda yt, yp: auc(*roc_curve(yt, yp)[:2])
+auc_ci    = lambda yt, yp: _bootstrap_ci(auc_score, yt, yp)
+brier_ci  = lambda yt, yp: _bootstrap_ci(brier_score_loss, yt, yp)
 
-# Post-hoc isotonic recalibration done correctly: hold out a calibration set at the
-# real class prevalence (never SMOTE-resampled). For each model we refit a clone with
-# the SAME tuned hyperparameters on SMOTE(fit-part), then learn the isotonic map on the
-# untouched calibration part, and evaluate on the test set. Published models are unchanged.
-from sklearn.model_selection import train_test_split as _tts
-X_fit, X_cal, y_fit, y_cal = _tts(X_train, y_train, test_size=0.25,
-                                  random_state=RNG, stratify=y_train)
-X_fit_s, y_fit_s = SMOTE(random_state=RNG).fit_resample(X_fit, y_fit)
-proba_cal = {}
-for name in ORDER:
-    base = clone(best_models[name]).fit(X_fit_s, y_fit_s)
-    cal = CalibratedClassifierCV(base, method='isotonic', cv='prefit').fit(X_cal, y_cal)
-    proba_cal[name] = cal.predict_proba(X_test)[:, 1]
 
-fig, axes = plt.subplots(1, 2, figsize=(12.4, 6.2), sharey=True)
-for ax, (probs, title) in zip(axes, [(proba, 'Before recalibration'),
-                                      (proba_cal, 'After isotonic recalibration')]):
-    ax.plot([0, 1], [0, 1], ls='--', lw=1.4, color='#333', label='Perfectly calibrated')
-    for name in ORDER:
-        frac_pos, mean_pred = calibration_curve(y_test, probs[name], n_bins=10, strategy='quantile')
-        ax.plot(mean_pred, frac_pos, marker='o', ms=5, lw=1.9, color=COLORS[name],
-                label=f"{lbl(name)} (Brier={brier_score_loss(y_test, probs[name]):.3f})")
-    ax.set_xlabel('Mean predicted probability'); ax.set_title(title)
-    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.legend(loc='upper left', fontsize=8.5, frameon=False)
-    ax.grid(alpha=.25)
-axes[0].set_ylabel('Observed fraction of deaths')
-fig.suptitle('Calibration curves (reliability diagram) — test set', y=1.00, fontsize=13)
-fig.tight_layout()
-fig.savefig(os.path.join(OUT, "calibration_curves_300dpi.png"), dpi=300)
-fig.savefig(os.path.join(OUT, "calibration_curves.tiff"), dpi=300)
-plt.close(fig)
+def specificity_from(y_true, y_pred):
+    """Specificity = TN / (TN + FP)."""
+    tn, fp, _, _ = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    return tn / (tn + fp) if (tn + fp) else np.nan
 
-# Brier scores after recalibration (for the digest / letter)
-cal_rows = []
-for name in ORDER:
-    b, lo, hi = brier_ci(y_test.values, proba_cal[name])
-    cal_rows.append({'Model': lbl(name), 'Brier (recalibrated)': round(b, 3),
-                     'Brier 95% CI': f"{lo:.3f}-{hi:.3f}"})
-pd.DataFrame(cal_rows).to_csv(os.path.join(OUT, "brier_recalibrated.csv"), index=False)
-print("[fig] calibration_curves_300dpi.png (before vs after isotonic recalibration)")
-print("[recalibrated Brier]\n", pd.DataFrame(cal_rows).to_string(index=False))
 
-# ================================================================ (3) Multi-threshold table (Table S1)
-THRESHOLDS = np.round(np.arange(0.10, 0.91, 0.10), 2)
-auc_cis = {name: auc_ci(y_test.values, proba[name]) for name in ORDER}
-rows = []
-for name in ORDER:
-    p = proba[name]
-    a, alo, ahi = auc_cis[name]
-    for t in THRESHOLDS:
-        yp = (p >= t).astype(int)
-        tn, fp, fn, tp = confusion_matrix(y_test, yp, labels=[0, 1]).ravel()
-        spec = tn / (tn + fp) if (tn + fp) else np.nan
-        rows.append({
-            'Model': lbl(name), 'Threshold': t,
-            'AUC-ROC': round(a, 3), 'AUC 95% CI': f"{alo:.3f}-{ahi:.3f}",
-            'Accuracy': round(accuracy_score(y_test, yp), 2),
-            'Sensitivity': round(recall_score(y_test, yp, zero_division=0), 2),
-            'Specificity': round(spec, 2),
-            'Precision': round(precision_score(y_test, yp, zero_division=0), 2),
-            'F1': round(f1_score(y_test, yp, zero_division=0), 2),
-            'MCC': round(matthews_corrcoef(y_test, yp), 2),
-        })
-tableS1 = pd.DataFrame(rows)
-tableS1.to_csv(os.path.join(OUT, "TableS1_multithreshold.csv"), index=False)
-print(f"[tab] TableS1_multithreshold.csv  ({len(tableS1)} rows, {len(THRESHOLDS)} thresholds x {len(ORDER)} models)")
+# -----------------------------------------------------------------------------
+#  (1) Discrimination + calibration summary (AUROC & Brier with 95% CI)
+# -----------------------------------------------------------------------------
+def discrimination_table(y_test, proba, out_dir):
+    rows = []
+    for name in MODEL_ORDER:
+        a, a_lo, a_hi = auc_ci(y_test.values, proba[name])
+        b, b_lo, b_hi = brier_ci(y_test.values, proba[name])
+        rows.append({"Model": label(name),
+                     "AUC-ROC": round(a, 3), "AUC 95% CI": f"{a_lo:.3f}-{a_hi:.3f}",
+                     "Brier": round(b, 3),  "Brier 95% CI": f"{b_lo:.3f}-{b_hi:.3f}"})
+    table = pd.DataFrame(rows)
+    table.to_csv(os.path.join(out_dir, "discrimination_calibration.csv"), index=False)
+    print("\n[AUROC + Brier, 95% CI]\n", table.to_string(index=False))
+    return table
 
-# ================================================================ (4) Decision Curve Analysis
-def net_benefit_model(yt, p, thr):
-    yt = np.asarray(yt); n = len(yt)
-    out = []
-    for t in thr:
-        pred = (p >= t).astype(int)
-        tp = np.sum((pred == 1) & (yt == 1))
-        fp = np.sum((pred == 1) & (yt == 0))
-        w = t / (1 - t)
-        out.append(tp / n - (fp / n) * w)
+
+# -----------------------------------------------------------------------------
+#  (2) Calibration curves — before and after isotonic recalibration
+# -----------------------------------------------------------------------------
+def recalibrate(best_models, X_train, y_train, X_test):
+    """Post-hoc isotonic recalibration, done correctly.
+
+    A calibration subset is held out from the training data *at the real class
+    prevalence* (never SMOTE-resampled). For each model a clone with the same
+    tuned hyper-parameters is refit on SMOTE(fit-part), and the isotonic map is
+    learned on the untouched calibration part. The published models are unchanged.
+    """
+    X_fit, X_cal, y_fit, y_cal = train_test_split(
+        X_train, y_train, test_size=0.25, random_state=RANDOM_STATE, stratify=y_train)
+    X_fit_s, y_fit_s = SMOTE(random_state=RANDOM_STATE).fit_resample(X_fit, y_fit)
+
+    proba_cal = {}
+    for name in MODEL_ORDER:
+        base = clone(best_models[name]).fit(X_fit_s, y_fit_s)
+        calibrated = CalibratedClassifierCV(base, method="isotonic", cv="prefit").fit(X_cal, y_cal)
+        proba_cal[name] = calibrated.predict_proba(X_test)[:, 1]
+    return proba_cal
+
+
+def plot_calibration(y_test, proba, proba_cal, out_dir):
+    """Two-panel reliability diagram: raw probabilities vs. recalibrated ones."""
+    fig, axes = plt.subplots(1, 2, figsize=(12.4, 6.2), sharey=True)
+    for ax, (probs, title) in zip(axes, [(proba, "Before recalibration"),
+                                          (proba_cal, "After isotonic recalibration")]):
+        ax.plot([0, 1], [0, 1], ls="--", lw=1.4, color="#333", label="Perfectly calibrated")
+        for name in MODEL_ORDER:
+            frac_pos, mean_pred = calibration_curve(y_test, probs[name], n_bins=10, strategy="quantile")
+            ax.plot(mean_pred, frac_pos, marker="o", ms=5, lw=1.9, color=COLOR[name],
+                    label=f"{label(name)} (Brier={brier_score_loss(y_test, probs[name]):.3f})")
+        ax.set_xlabel("Mean predicted probability")
+        ax.set_title(title)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.legend(loc="upper left", fontsize=8.5, frameon=False)
+        ax.grid(alpha=.25)
+    axes[0].set_ylabel("Observed fraction of deaths")
+    fig.suptitle("Calibration curves (reliability diagram) — test set", y=1.00, fontsize=13)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "calibration_curves_300dpi.png"), dpi=300)
+    fig.savefig(os.path.join(out_dir, "calibration_curves.tiff"), dpi=300)
+    plt.close(fig)
+
+    # Brier score after recalibration (with 95% CI) for the manuscript/letter
+    rows = []
+    for name in MODEL_ORDER:
+        b, lo, hi = brier_ci(y_test.values, proba_cal[name])
+        rows.append({"Model": label(name), "Brier (recalibrated)": round(b, 3),
+                     "Brier 95% CI": f"{lo:.3f}-{hi:.3f}"})
+    pd.DataFrame(rows).to_csv(os.path.join(out_dir, "brier_recalibrated.csv"), index=False)
+    print("[fig] calibration_curves_300dpi.png (before vs after isotonic recalibration)")
+    print("[recalibrated Brier]\n", pd.DataFrame(rows).to_string(index=False))
+
+
+# -----------------------------------------------------------------------------
+#  (3) Multi-threshold performance table (Supplementary Table S1)
+# -----------------------------------------------------------------------------
+def threshold_table(y_test, proba, out_dir):
+    """Threshold-dependent metrics for every model across THRESHOLDS."""
+    auc_cache = {name: auc_ci(y_test.values, proba[name]) for name in MODEL_ORDER}
+    rows = []
+    for name in MODEL_ORDER:
+        a, a_lo, a_hi = auc_cache[name]                   # AUROC is threshold-independent
+        for t in THRESHOLDS:
+            y_pred = (proba[name] >= t).astype(int)
+            rows.append({
+                "Model": label(name), "Threshold": t,
+                "AUC-ROC": round(a, 3), "AUC 95% CI": f"{a_lo:.3f}-{a_hi:.3f}",
+                "Accuracy":    round(accuracy_score(y_test, y_pred), 2),
+                "Sensitivity": round(recall_score(y_test, y_pred, zero_division=0), 2),
+                "Specificity": round(specificity_from(y_test, y_pred), 2),
+                "Precision":   round(precision_score(y_test, y_pred, zero_division=0), 2),
+                "F1":          round(f1_score(y_test, y_pred, zero_division=0), 2),
+                "MCC":         round(matthews_corrcoef(y_test, y_pred), 2),
+            })
+    table = pd.DataFrame(rows)
+    table.to_csv(os.path.join(out_dir, "TableS1_multithreshold.csv"), index=False)
+    print(f"[tab] TableS1_multithreshold.csv "
+          f"({len(table)} rows = {len(THRESHOLDS)} thresholds x {len(MODEL_ORDER)} models)")
+    return table
+
+
+# -----------------------------------------------------------------------------
+#  (4) Decision curve analysis (net benefit)
+# -----------------------------------------------------------------------------
+def _net_benefit(y_true, y_prob, thresholds):
+    """Net benefit = TP/n - (FP/n) * (p_t / (1 - p_t)) for each threshold p_t."""
+    y_true, n, out = np.asarray(y_true), len(y_true), []
+    for t in thresholds:
+        y_pred = (y_prob >= t).astype(int)
+        tp = np.sum((y_pred == 1) & (y_true == 1))
+        fp = np.sum((y_pred == 1) & (y_true == 0))
+        out.append(tp / n - (fp / n) * (t / (1 - t)))
     return np.array(out)
 
-pt = np.linspace(0.01, 0.60, 120)          # threshold-probability grid
-prev = np.mean(y_test.values)
-nb_all = prev - (1 - prev) * (pt / (1 - pt))  # treat-all
-nb_none = np.zeros_like(pt)                   # treat-none
 
-fig, ax = plt.subplots(figsize=(7.6, 6.0))
-ax.plot(pt, nb_none, color='#000', lw=1.3, ls=':', label='Treat none')
-ax.plot(pt, nb_all, color='#888', lw=1.4, ls='--', label='Treat all')
-for name in ORDER:
-    ax.plot(pt, net_benefit_model(y_test.values, proba[name], pt),
-            lw=1.9, color=COLORS[name], label=lbl(name))
-ax.set_xlabel('Threshold probability'); ax.set_ylabel('Net benefit')
-ax.set_title('Decision curve analysis — in-hospital mortality')
-ax.set_ylim(-0.02, prev + 0.03); ax.set_xlim(0, 0.60)
-ax.legend(loc='upper right', fontsize=9, frameon=False); ax.grid(alpha=.25)
-fig.tight_layout()
-fig.savefig(os.path.join(OUT, "decision_curve_analysis_300dpi.png"), dpi=300)
-fig.savefig(os.path.join(OUT, "decision_curve_analysis.tiff"), dpi=300)
-plt.close(fig)
+def plot_decision_curve(y_test, proba, out_dir):
+    """Decision curve analysis vs. the treat-all / treat-none reference strategies."""
+    grid = np.linspace(0.01, 0.60, 120)
+    prevalence = float(np.mean(y_test.values))
+    nb_treat_all = prevalence - (1 - prevalence) * (grid / (1 - grid))
 
-# net-benefit summary at representative thresholds for the text
-dca_rows = []
-for t in [0.05, 0.10, 0.15, 0.20, 0.30]:
-    row = {'Threshold': t,
-           'Treat all': round(float(prev - (1 - prev) * (t / (1 - t))), 4),
-           'Treat none': 0.0}
-    for name in ORDER:
-        row[lbl(name)] = round(float(net_benefit_model(y_test.values, proba[name], [t])[0]), 4)
-    dca_rows.append(row)
-dca_df = pd.DataFrame(dca_rows)
-dca_df.to_csv(os.path.join(OUT, "dca_net_benefit_summary.csv"), index=False)
-print("[fig] decision_curve_analysis_300dpi.png")
-print("\n[DCA net benefit]\n", dca_df.to_string(index=False))
+    fig, ax = plt.subplots(figsize=(7.6, 6.0))
+    ax.plot(grid, np.zeros_like(grid), ls=":",  lw=1.3, color="#000", label="Treat none")
+    ax.plot(grid, nb_treat_all,        ls="--", lw=1.4, color="#888", label="Treat all")
+    for name in MODEL_ORDER:
+        ax.plot(grid, _net_benefit(y_test.values, proba[name], grid),
+                lw=1.9, color=COLOR[name], label=label(name))
+    ax.set_xlabel("Threshold probability")
+    ax.set_ylabel("Net benefit")
+    ax.set_title("Decision curve analysis — in-hospital mortality")
+    ax.set_xlim(0, 0.60)
+    ax.set_ylim(-0.02, prevalence + 0.03)
+    ax.legend(loc="upper right", fontsize=9, frameon=False)
+    ax.grid(alpha=.25)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "decision_curve_analysis_300dpi.png"), dpi=300)
+    fig.savefig(os.path.join(out_dir, "decision_curve_analysis.tiff"), dpi=300)
+    plt.close(fig)
 
-# ---------------------------------------------------------------- machine-readable digest for letter
-digest = {
-    'test_prevalence': round(float(prev), 4),
-    'n_test': int(len(y_test)),
-    'brier': brier_df.to_dict(orient='records'),
-    'dca_summary': dca_df.to_dict(orient='records'),
-    'thresholds': THRESHOLDS.tolist(),
-}
-with open(os.path.join(OUT, "digest.json"), "w") as f:
-    json.dump(digest, f, indent=2)
-print("\n[done] all outputs in", OUT)
+    # Net benefit at a few representative thresholds, for the text
+    rows = []
+    for t in [0.05, 0.10, 0.15, 0.20, 0.30]:
+        row = {"Threshold": t,
+               "Treat all": round(float(prevalence - (1 - prevalence) * (t / (1 - t))), 4),
+               "Treat none": 0.0}
+        for name in MODEL_ORDER:
+            row[label(name)] = round(float(_net_benefit(y_test.values, proba[name], [t])[0]), 4)
+        rows.append(row)
+    summary = pd.DataFrame(rows)
+    summary.to_csv(os.path.join(out_dir, "dca_net_benefit_summary.csv"), index=False)
+    print("[fig] decision_curve_analysis_300dpi.png")
+    print("\n[DCA net benefit]\n", summary.to_string(index=False))
+    return summary, prevalence
+
+
+# -----------------------------------------------------------------------------
+#  Orchestration
+# -----------------------------------------------------------------------------
+def main():
+    # Resolve the dataset path (CLI argument, else search the working tree)
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = sys.argv[1:2] or glob.glob(os.path.join(here, "**", "Banco_Internacao.csv"),
+                                             recursive=True)
+    assert candidates, "Banco_Internacao.csv not found"
+    csv_path = candidates[0]
+
+    out_dir = os.path.join(here, "outputs")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # --- Data ---------------------------------------------------------------
+    df = load_analytic_sample(csv_path)
+    X, y = build_features(df)
+    print(f"[y] positive (death) rate = {y.mean():.4f}")
+
+    # --- Split + SMOTE (as in the notebook) ---------------------------------
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y)
+    X_train_smote, y_train_smote = SMOTE(random_state=RANDOM_STATE).fit_resample(X_train, y_train)
+
+    # --- Train + predicted probabilities on the test set --------------------
+    best_models = tune_models(X_train_smote, y_train_smote)
+    proba = {name: model.predict_proba(X_test)[:, 1] for name, model in best_models.items()}
+
+    # --- Reviewer-5 analyses ------------------------------------------------
+    discrimination_table(y_test, proba, out_dir)                       # (1)
+    proba_cal = recalibrate(best_models, X_train, y_train, X_test)     # (2) recalibration
+    plot_calibration(y_test, proba, proba_cal, out_dir)               #     figure + Brier
+    threshold_table(y_test, proba, out_dir)                           # (3)
+    _, prevalence = plot_decision_curve(y_test, proba, out_dir)       # (4)
+
+    # --- Machine-readable digest -------------------------------------------
+    with open(os.path.join(out_dir, "digest.json"), "w") as fh:
+        json.dump({"csv_path": csv_path, "n_test": int(len(y_test)),
+                   "test_prevalence": round(prevalence, 4),
+                   "thresholds": THRESHOLDS.tolist()}, fh, indent=2)
+    print("\n[done] all outputs in", out_dir)
+
+
+if __name__ == "__main__":
+    main()
