@@ -47,6 +47,11 @@ print(f"[out ] {OUT}")
 # ---------------------------------------------------------------- load (as in notebook)
 df = pd.read_csv(CSV_PATH, sep=";").drop("Sexo", axis=1)
 
+# analytic sample used in the manuscript: exclude records with unknown race
+# (R cleaning script line 235: filter(RacaCor != "*Nao informado")) -> n=3493, deaths=345
+df = df[df["RacaCor"] != "*Nao informado"].reset_index(drop=True)
+print(f"[filter] RacaCor != '*Nao informado' -> n={len(df)}")
+
 cols_num = ['DiasDePermanencia', 'NumeroInternacoes', 'ValorTotal', 'Idade']
 cols_cat = ['AnoInternacao', 'CaraterInternacao', 'Complexidade', 'DiagnosticoPrincipal',
             'Especialidade', 'FoiAObito', 'Gestao', 'HospitalNome',
@@ -130,44 +135,89 @@ def brier_ci(yt, p, n_boot=2000, seed=RNG):
     lo, hi = np.percentile(bs, [2.5, 97.5])
     return base, lo, hi
 
+def auc_ci(yt, p, n_boot=2000, seed=RNG):
+    yt = np.asarray(yt); p = np.asarray(p)
+    base = auc(*roc_curve(yt, p)[:2])
+    rng = np.random.default_rng(seed); idx = np.arange(len(yt)); bs = []
+    for _ in range(n_boot):
+        b = rng.choice(idx, len(idx), replace=True)
+        if len(np.unique(yt[b])) < 2:
+            continue
+        fpr, tpr, _ = roc_curve(yt[b], p[b]); bs.append(auc(fpr, tpr))
+    lo, hi = np.percentile(bs, [2.5, 97.5])
+    return base, lo, hi
+
 brier_rows = []
 for name in ORDER:
-    b, lo, hi = brier_ci(y_test.values, proba[name])
-    fpr, tpr, _ = roc_curve(y_test, proba[name]); a = auc(fpr, tpr)
-    brier_rows.append({'Model': lbl(name), 'AUC-ROC': round(a, 3),
-                       'Brier': round(b, 3), 'Brier 95% CI': f"{lo:.3f}-{hi:.3f}"})
+    b, blo, bhi = brier_ci(y_test.values, proba[name])
+    a, alo, ahi = auc_ci(y_test.values, proba[name])
+    brier_rows.append({'Model': lbl(name),
+                       'AUC-ROC': round(a, 3), 'AUC 95% CI': f"{alo:.3f}-{ahi:.3f}",
+                       'Brier': round(b, 3), 'Brier 95% CI': f"{blo:.3f}-{bhi:.3f}"})
 brier_df = pd.DataFrame(brier_rows)
-brier_df.to_csv(os.path.join(OUT, "brier_scores.csv"), index=False)
-print("\n[Brier]\n", brier_df.to_string(index=False))
+brier_df.to_csv(os.path.join(OUT, "discrimination_calibration.csv"), index=False)
+print("\n[AUROC + Brier with 95% CI]\n", brier_df.to_string(index=False))
 
-# ================================================================ (1) Calibration curves
-fig, ax = plt.subplots(figsize=(7.2, 6.4))
-ax.plot([0, 1], [0, 1], ls='--', lw=1.4, color='#333', label='Perfectly calibrated')
+# ================================================================ (1) Calibration curves (before vs after recalibration)
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.base import clone
+
+# Post-hoc isotonic recalibration done correctly: hold out a calibration set at the
+# real class prevalence (never SMOTE-resampled). For each model we refit a clone with
+# the SAME tuned hyperparameters on SMOTE(fit-part), then learn the isotonic map on the
+# untouched calibration part, and evaluate on the test set. Published models are unchanged.
+from sklearn.model_selection import train_test_split as _tts
+X_fit, X_cal, y_fit, y_cal = _tts(X_train, y_train, test_size=0.25,
+                                  random_state=RNG, stratify=y_train)
+X_fit_s, y_fit_s = SMOTE(random_state=RNG).fit_resample(X_fit, y_fit)
+proba_cal = {}
 for name in ORDER:
-    frac_pos, mean_pred = calibration_curve(y_test, proba[name], n_bins=10, strategy='quantile')
-    ax.plot(mean_pred, frac_pos, marker='o', ms=5, lw=1.9, color=COLORS[name],
-            label=f"{lbl(name)} (Brier={brier_score_loss(y_test, proba[name]):.3f})")
-ax.set_xlabel('Mean predicted probability'); ax.set_ylabel('Observed fraction of deaths')
-ax.set_title('Calibration curves (reliability diagram) — test set')
-ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.legend(loc='upper left', fontsize=9, frameon=False)
-ax.grid(alpha=.25)
+    base = clone(best_models[name]).fit(X_fit_s, y_fit_s)
+    cal = CalibratedClassifierCV(base, method='isotonic', cv='prefit').fit(X_cal, y_cal)
+    proba_cal[name] = cal.predict_proba(X_test)[:, 1]
+
+fig, axes = plt.subplots(1, 2, figsize=(12.4, 6.2), sharey=True)
+for ax, (probs, title) in zip(axes, [(proba, 'Before recalibration'),
+                                      (proba_cal, 'After isotonic recalibration')]):
+    ax.plot([0, 1], [0, 1], ls='--', lw=1.4, color='#333', label='Perfectly calibrated')
+    for name in ORDER:
+        frac_pos, mean_pred = calibration_curve(y_test, probs[name], n_bins=10, strategy='quantile')
+        ax.plot(mean_pred, frac_pos, marker='o', ms=5, lw=1.9, color=COLORS[name],
+                label=f"{lbl(name)} (Brier={brier_score_loss(y_test, probs[name]):.3f})")
+    ax.set_xlabel('Mean predicted probability'); ax.set_title(title)
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.legend(loc='upper left', fontsize=8.5, frameon=False)
+    ax.grid(alpha=.25)
+axes[0].set_ylabel('Observed fraction of deaths')
+fig.suptitle('Calibration curves (reliability diagram) — test set', y=1.00, fontsize=13)
 fig.tight_layout()
 fig.savefig(os.path.join(OUT, "calibration_curves_300dpi.png"), dpi=300)
 fig.savefig(os.path.join(OUT, "calibration_curves.tiff"), dpi=300)
 plt.close(fig)
-print("[fig] calibration_curves_300dpi.png")
+
+# Brier scores after recalibration (for the digest / letter)
+cal_rows = []
+for name in ORDER:
+    b, lo, hi = brier_ci(y_test.values, proba_cal[name])
+    cal_rows.append({'Model': lbl(name), 'Brier (recalibrated)': round(b, 3),
+                     'Brier 95% CI': f"{lo:.3f}-{hi:.3f}"})
+pd.DataFrame(cal_rows).to_csv(os.path.join(OUT, "brier_recalibrated.csv"), index=False)
+print("[fig] calibration_curves_300dpi.png (before vs after isotonic recalibration)")
+print("[recalibrated Brier]\n", pd.DataFrame(cal_rows).to_string(index=False))
 
 # ================================================================ (3) Multi-threshold table (Table S1)
 THRESHOLDS = np.round(np.arange(0.10, 0.91, 0.10), 2)
+auc_cis = {name: auc_ci(y_test.values, proba[name]) for name in ORDER}
 rows = []
 for name in ORDER:
     p = proba[name]
+    a, alo, ahi = auc_cis[name]
     for t in THRESHOLDS:
         yp = (p >= t).astype(int)
         tn, fp, fn, tp = confusion_matrix(y_test, yp, labels=[0, 1]).ravel()
         spec = tn / (tn + fp) if (tn + fp) else np.nan
         rows.append({
             'Model': lbl(name), 'Threshold': t,
+            'AUC-ROC': round(a, 3), 'AUC 95% CI': f"{alo:.3f}-{ahi:.3f}",
             'Accuracy': round(accuracy_score(y_test, yp), 2),
             'Sensitivity': round(recall_score(y_test, yp, zero_division=0), 2),
             'Specificity': round(spec, 2),

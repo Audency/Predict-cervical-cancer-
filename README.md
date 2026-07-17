@@ -7,7 +7,7 @@
 <p align="center">
   <img alt="Task" src="https://img.shields.io/badge/Task-In--hospital_mortality-0d5c63">
   <img alt="Models" src="https://img.shields.io/badge/Models-5_ML_algorithms-c1666b">
-  <img alt="Best AUC" src="https://img.shields.io/badge/Best_AUC--ROC-0.88_(XGBoost)-e08e0b">
+  <img alt="Best AUC" src="https://img.shields.io/badge/Best_AUC--ROC-0.89_(XGBoost)-e08e0b">
   <img alt="Interpretability" src="https://img.shields.io/badge/Interpretability-SHAP-5b8c5a">
   <img alt="Journal" src="https://img.shields.io/badge/Under_review-BMC_Cancer-informational">
 </p>
@@ -32,13 +32,15 @@ Admission records  →  Encoding  →  Stratified split + SMOTE  →  5-fold tun
 
 | Model | AUC-ROC | Accuracy* | Sensitivity* | Specificity* | Brier (95% CI) |
 |:------|:-------:|:---------:|:------------:|:------------:|:--------------:|
-| **XGBoost** | **0.88** | 0.89 | 0.32 | 0.95 | **0.086** (0.072–0.102) |
-| Random Forest | 0.87 | 0.87 | 0.32 | 0.93 | 0.084 (0.072–0.096) |
-| CatBoost | 0.89 | 0.88 | 0.29 | 0.94 | 0.082 (0.069–0.096) |
-| LightGBM | 0.88 | 0.88 | 0.21 | 0.95 | 0.085 (0.071–0.101) |
-| Logistic Regression | 0.88 | 0.78 | 0.82 | 0.78 | 0.139 (0.122–0.156) |
+| **XGBoost** | **0.89 (0.86–0.91)** | 0.88 | 0.31 | 0.95 | **0.08** (0.07–0.10) |
+| Random Forest | 0.88 (0.85–0.90) | 0.88 | 0.32 | 0.94 | 0.08 (0.07–0.10) |
+| CatBoost | 0.88 (0.85–0.90) | 0.88 | 0.33 | 0.94 | 0.09 (0.08–0.11) |
+| LightGBM | 0.87 (0.84–0.90) | 0.87 | 0.22 | 0.94 | 0.09 (0.08–0.11) |
+| Logistic Regression | 0.88 (0.85–0.91) | 0.79 | 0.82 | 0.78 | 0.14 (0.12–0.15) |
 
-<sub>*Threshold-dependent metrics reported at the conventional 0.5 cut-off. Full metrics across thresholds 0.10–0.90 are in [`TableS1_multithreshold.csv`](TableS1_multithreshold.csv).</sub>
+<sub>*Threshold-dependent metrics reported at the conventional 0.5 cut-off. AUC-ROC and Brier are shown with 95% CIs ([`discrimination_calibration.csv`](discrimination_calibration.csv)); full metrics across thresholds 0.10–0.90 are in [`TableS1_multithreshold.csv`](TableS1_multithreshold.csv).</sub>
+
+<sub>**Analytic sample:** n = 3,493 hospitalizations (345 in-hospital deaths), obtained from the source records by excluding cases with unknown race. All results and the reproducible script use this sample.</sub>
 
 The tree-based models combined **strong discrimination** with **good calibration** (low Brier scores), while Logistic Regression traded specificity for sensitivity and was noticeably less well calibrated.
 
@@ -49,9 +51,9 @@ The tree-based models combined **strong discrimination** with **good calibration
 ### Discrimination — ROC curves
 <p align="center"><img src="all_roc_auc_models_300dpi.png" width="620" alt="ROC curves for all models"></p>
 
-### Calibration — reliability diagram
-The four tree-based models track the perfect-calibration diagonal closely across the probability range where most patients lie; Logistic Regression falls well below it, over-estimating risk.
-<p align="center"><img src="calibration_curves_300dpi.png" width="560" alt="Calibration curves"></p>
+### Calibration — reliability diagram (before vs after recalibration)
+Before recalibration, the tree-based models track the diagonal reasonably well while Logistic Regression over-estimates risk. After **post-hoc isotonic recalibration** (fitted on a held-out calibration subset at the real class prevalence), **all five models are well calibrated**, with Brier scores converging to ≈0.07–0.08 ([`brier_recalibrated.csv`](brier_recalibrated.csv)).
+<p align="center"><img src="calibration_curves_300dpi.png" width="820" alt="Calibration curves before and after isotonic recalibration"></p>
 
 ### Clinical utility — decision curve analysis
 Across the clinically relevant range of threshold probabilities (~0.02–0.40), **every ML model yields a higher net benefit than the "treat-all" and "treat-none" defaults**, supporting model-guided risk stratification and resource allocation.
@@ -74,7 +76,7 @@ Medical procedure type, hospitalization cost and service complexity were the mos
 | [`reviewer5_additional_analyses.py`](reviewer5_additional_analyses.py) | Stand-alone, reproducible script for the calibration curves, multi-threshold table and decision curve analysis |
 | `Banco_Internacao.csv` | De-identified hospitalization dataset (SIH/SUS) |
 | `calibration_curves_300dpi.png` · `decision_curve_analysis_300dpi.png` | New figures (Reviewer 5) |
-| `TableS1_multithreshold.csv` · `brier_scores.csv` · `dca_net_benefit_summary.csv` | New result tables |
+| `TableS1_multithreshold.csv` · `discrimination_calibration.csv` · `dca_net_benefit_summary.csv` · `brier_recalibrated.csv` | New result tables (AUROC & Brier with 95% CI; Brier after recalibration) |
 | `roc_auc_*_300dpi.png` · `heatmap_*_300dpi.png` · `bar-shap_*` · `bsw-shape_*` | Discrimination, correlation and SHAP figures |
 
 ---
@@ -86,10 +88,11 @@ Medical procedure type, hospitalization cost and service complexity were the mos
 pip install scikit-learn category_encoders imbalanced-learn xgboost lightgbm catboost matplotlib pandas numpy
 
 python reviewer5_additional_analyses.py Banco_Internacao.csv
-# → writes calibration_curves, decision_curve_analysis, TableS1_multithreshold, brier_scores to ./outputs
+# → writes calibration_curves, decision_curve_analysis, TableS1_multithreshold,
+#   discrimination_calibration (AUROC & Brier with 95% CI) to ./outputs
 ```
 
-The script mirrors the notebook exactly: identical feature encoding, stratified split (`random_state=42`), SMOTE on the training fold, and `GridSearchCV` over the same hyper-parameter grids.
+The script mirrors the notebook exactly: identical feature encoding, stratified split (`random_state=42`), SMOTE on the training fold, and `GridSearchCV` over the same hyper-parameter grids. It restricts to the analytic sample (n = 3,493) by excluding records with unknown race.
 
 ---
 
