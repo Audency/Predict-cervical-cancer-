@@ -1,0 +1,6 @@
+Model,AUC-ROC,Brier,Brier 95% CI
+XGBoost,0.879,0.086,0.072-0.102
+RandomForest,0.874,0.084,0.072-0.096
+CatBoost,0.885,0.082,0.069-0.096
+LightGBM,0.882,0.085,0.071-0.101
+Logistic Regression,0.882,0.139,0.122-0.156
